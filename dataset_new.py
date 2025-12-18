@@ -1,0 +1,297 @@
+
+import numpy as np
+import glob
+import scipy.io as sio
+import torch
+from torch.utils.data import Dataset, DataLoader
+from scipy.interpolate import interp1d, Rbf,Akima1DInterpolator, make_interp_spline# 引入 scipy 的插值工具
+
+def UT_HAR_dataset(root_dir, sample_rate=1.0, sample_method='uniform_nearest',
+                   interpolation_method='linear', use_energy_input=1, use_mask_0=0):
+    """
+    加载 UT_HAR 数据集，并应用降采样和插值策略。
+
+    Args:
+        root_dir (str): 数据集根目录。
+        sample_rate (float): 采样率 (0.0 - 1.0)。
+        sample_method (str): 采样方法 ('uniform_nearest', 'gaussian', etc.)。
+        interpolation_method (str): 插值方法。
+        use_energy_input (bool): (预留接口，目前UT_HAR原始逻辑主要是归一化)。
+        use_mask_0 (bool): 是否使用 Mask 模式。
+
+    Returns:
+        dict: 包含数据和标签的字典。
+    """
+    data_list = glob.glob(root_dir+'/UT_HAR/data/*.csv')
+    label_list = glob.glob(root_dir+'/UT_HAR/label/*.csv')
+    WiFi_data = {}
+    for data_dir in data_list:
+        data_name = data_dir.split('/')[-1].split('.')[0]
+        with open(data_dir, 'rb') as f:
+            data = np.load(f)
+            data = data.reshape(len(data),1,250,90)
+            data_norm = (data - np.min(data)) / (np.max(data) - np.min(data))
+            # ==================== 插入降采样/插值逻辑 ====================
+            # 只有当需要采样(sample_rate < 1.0) 或者 需要Mask (use_mask_0=True) 时才执行
+            if sample_rate < 1.0 or use_mask_0:
+                processed_data_list = []
+                # 因为 data_norm 是一个 Batch 的数据，我们需要逐个样本处理
+                for i in range(len(data_norm)):
+                    # 取出一个样本: shape (1, 250, 90)
+                    sample = data_norm[i]
+                    # 1. 维度变换: (1, 250, 90) -> (90, 250)
+                    # 我们的处理函数期望 (Channels, Time)，在 UT_HAR 中 90 是特征通道，250 是时间
+                    sample_reshaped = sample.squeeze(0).transpose(1, 0)  # 变为 (90, 250)
+                    # 2. 调用通用的处理函数 (请确保 resample_signal_data 已定义)
+                    sample_processed = resample_signal_data(
+                        sample_reshaped,
+                        sample_rate=sample_rate,
+                        sample_method=sample_method,
+                        use_mask_0=use_mask_0,
+                        interpolation_method=interpolation_method
+                    )
+                    # 3. 维度还原: (90, 250) -> (1, 250, 90)
+                    # 先转置回 (250, 90)，再增加维度 (1, 250, 90)
+                    sample_restored = sample_processed.transpose(1, 0)[np.newaxis, :, :]
+                    processed_data_list.append(sample_restored)
+                # 将处理后的列表重新堆叠为 numpy array
+                data_norm = np.stack(processed_data_list, axis=0)
+            # ==========================================================
+        WiFi_data[data_name] = torch.Tensor(data_norm)
+    for label_dir in label_list:
+        label_name = label_dir.split('/')[-1].split('.')[0]
+        with open(label_dir, 'rb') as f:
+            label = np.load(f)
+        WiFi_data[label_name] = torch.Tensor(label)
+    return WiFi_data
+
+
+# dataset: /class_name/xx.mat
+class CSI_Dataset(Dataset):
+    """CSI dataset."""
+
+    def __init__(self, root_dir, modal='CSIamp', transform=None, sample_rate=1.0, sample_method='uniform_nearest', interpolation_method='linear',use_energy_input = 1,use_mask_0 = 0,few_shot=False, k=5, single_trace=True):
+        """
+        USE_ENERGY_INPUT = True  # 设置为 True 使用能量，设置为 False 使用幅度 在 CSI_Dataset 中
+        USE_MASK_0 = False  #默认不mask，即用插值
+        Args:
+            root_dir (string): Directory with all the images.
+            modal (CSIamp/CSIphase): CSI data modal
+            transform (callable, optional): Optional transform to be applied
+                on a sample.
+        """
+        self.root_dir = root_dir
+        self.modal=modal
+        self.transform = transform
+        self.data_list = glob.glob(root_dir+'/*/*.mat')
+        self.folder = glob.glob(root_dir+'/*/')
+        self.category = {self.folder[i].split('/')[-2]:i for i in range(len(self.folder))}
+        self.sample_rate = sample_rate  # 保存采样率
+        self.sample_method = sample_method  # 保存采样方法
+        self.interpolation_method = interpolation_method  # 保存插值方法
+        self.use_energy_input = use_energy_input
+        self.use_mask_0 = use_mask_0
+    def __len__(self):
+        return len(self.data_list)
+
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+
+        sample_dir = self.data_list[idx]
+        y = self.category[sample_dir.split('/')[-2]]
+        x = sio.loadmat(sample_dir)[self.modal]
+        x = x[:, ::4]
+        if self.use_energy_input:
+            x = np.square(x)
+            x = (x - 1815.7732) / 396.1198
+        else:
+            x = (x - 42.3199) / 4.9802
+
+        # 此时 x 的形状应该是 (Channels, Time)，例如 (342, 500) 或者类似
+        # 确保 x 是 (C, T) 格式传入
+
+        # ==================== 调用通用函数 ====================
+        x = resample_signal_data(
+            x,
+            self.sample_rate,
+            self.sample_method,
+            self.use_mask_0,
+            self.interpolation_method
+        )
+
+
+        x = x.reshape(3, 114, 500)
+        if self.transform:
+            x = self.transform(x)
+
+        x = torch.FloatTensor(x)
+
+        return x,y
+
+
+class Widar_Dataset(Dataset):
+    def __init__(self,root_dir):
+        self.root_dir = root_dir
+        self.data_list = glob.glob(root_dir+'/*/*.csv')
+        self.folder = glob.glob(root_dir+'/*/')
+        self.category = {self.folder[i].split('/')[-2]:i for i in range(len(self.folder))}
+
+    def __len__(self):
+        return len(self.data_list)
+
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+
+        sample_dir = self.data_list[idx]
+        y = self.category[sample_dir.split('/')[-2]]
+        x = np.genfromtxt(sample_dir, delimiter=',')
+
+        # normalize
+        x = (x - 0.0025)/0.0119
+
+        # reshape: 22,400 -> 22,20,20
+        x = x.reshape(22,20,20)
+        # interpolate from 20x20 to 32x32
+        # x = self.reshape(x)
+        x = torch.FloatTensor(x)
+        return x,y
+
+
+# ----------------- 为IDW插值创建一个辅助函数 -----------------
+def idw_interpolation(x_known, y_known, x_interp, p=2):
+    """
+    一维反距离权重插值 (IDW)。
+    Args:
+        x_known: 已知点的 x 坐标 (1D array)。
+        y_known: 已知点的 y 值 (1D array)。
+        x_interp: 需要插值的点的 x 坐标 (1D array)。
+        p: 幂参数，通常为2。
+    Returns:
+        插值后的 y 值 (1D array)。
+    """
+    y_interp = np.zeros_like(x_interp, dtype=float)
+    for i, x in enumerate(x_interp):
+        # 计算到所有已知点的距离
+        distances = np.abs(x_known - x)
+
+        # 如果插值点恰好是已知点，直接返回值
+        if np.any(distances == 0):
+            y_interp[i] = y_known[np.argmin(distances)]
+            continue
+
+        # 计算权重 (距离的倒数的 p 次方)
+        weights = 1.0 / (distances ** p)
+
+        # 计算加权平均值
+        y_interp[i] = np.sum(weights * y_known) / np.sum(weights)
+
+    return y_interp
+
+def resample_signal_data(x, sample_rate, sample_method, use_mask_0, interpolation_method):
+    """
+    通用的信号重采样/插值处理函数。
+    自动适配输入数据的长度。
+
+    Args:
+        x (np.array): 输入数据，形状必须为 (Channels, Time)。
+                      对于 CSI_Dataset 是 (C, 500), 对于 UT_HAR 是 (90, 250)。
+        sample_rate (float): 采样率 (0.0 - 1.0)。
+        sample_method (str): 'uniform_nearest', 'equidistant', 'gaussian', 'poisson'。
+        use_mask_0 (bool): 是否使用 Mask 模式。
+        interpolation_method (str): 插值方法。
+
+    Returns:
+        np.array: 处理后的数据，形状保持 (Channels, Time)。
+    """
+    # 0. 如果不需要降采样，直接返回
+    if sample_rate >= 1.0:
+        return x
+
+    # 自动获取当前数据的长度 (CSI=500, UT_HAR=250)
+    original_len = x.shape[1]
+    resample_len = int(original_len * sample_rate)
+
+    # ================= 1. 计算采样索引 =================
+    pick_indices_int = None
+
+    if sample_method == 'uniform_nearest':
+        pick_indices_float = np.linspace(0, original_len - 1, resample_len)
+        pick_indices_int = np.round(pick_indices_float).astype(int)
+
+    elif sample_method == 'equidistant':
+        step = original_len / resample_len
+        pick_indices_int = np.arange(0, original_len, step).astype(int)[:resample_len]
+
+    elif sample_method == 'gaussian':
+        # 模拟网络抖动，间隔服从正态分布
+        intervals = np.random.normal(loc=1.0, scale=0.5, size=resample_len - 1)
+        intervals = np.abs(intervals)
+        total_duration = original_len - 1
+        intervals = intervals / intervals.sum() * total_duration
+        pick_indices_float = np.hstack(([0], np.cumsum(intervals)))
+        pick_indices_int = np.round(pick_indices_float).astype(int)
+
+    elif sample_method == 'poisson':
+        # 模拟泊松到达，间隔服从指数分布
+        intervals = np.random.exponential(scale=1.0, size=resample_len - 1)
+        total_duration = original_len - 1
+        intervals = intervals / intervals.sum() * total_duration
+        pick_indices_float = np.hstack(([0], np.cumsum(intervals)))
+        pick_indices_int = np.round(pick_indices_float).astype(int)
+
+    else:
+        raise ValueError(f"Unknown sample method: {sample_method}")
+
+    # 去重并排序 (适配随机采样)
+    pick_indices_int = np.unique(pick_indices_int)
+
+    # ================= 2. Mask 或 插值 =================
+    if use_mask_0:
+        # --- 模式 A: 掩码 (Masking) ---
+        x_sparse = np.zeros_like(x)
+        x_sparse[:, pick_indices_int] = x[:, pick_indices_int]
+        x = x_sparse
+    else:
+        # --- 模式 B: 降采样 + 插值 (Resample + Interpolate) ---
+        # 1. 先取出已知点
+        x_downsampled = x[:, pick_indices_int]
+
+        # 2. 准备坐标
+        x_known = pick_indices_int  # 已知点的 X 坐标
+        x_new = np.arange(original_len)  # 需要恢复的目标 X 坐标 (0 到 original_len-1)
+        x_upsampled = np.zeros_like(x, dtype=float)
+
+        # 3. 对每个通道独立插值
+        for i in range(x.shape[0]):
+            y_known = x_downsampled[i, :]
+
+            f_interp = None
+            if interpolation_method == 'linear':
+                f_interp = interp1d(x_known, y_known, kind='linear', bounds_error=False, fill_value="extrapolate")
+                x_upsampled[i, :] = f_interp(x_new)
+            elif interpolation_method == 'cubic':
+                f_interp = interp1d(x_known, y_known, kind='cubic', bounds_error=False, fill_value="extrapolate")
+                x_upsampled[i, :] = f_interp(x_new)
+            elif interpolation_method == 'nearest':
+                f_interp = interp1d(x_known, y_known, kind='nearest', bounds_error=False, fill_value="extrapolate")
+                x_upsampled[i, :] = f_interp(x_new)
+            elif interpolation_method == 'idw':
+                # 请确保 idw_interpolation 函数可用
+                # x_upsampled[i, :] = idw_interpolation(x_known, y_known, x_new)
+                pass
+            elif interpolation_method == 'rbf':
+                rbf_func = Rbf(x_known, y_known, function='multiquadric')
+                x_upsampled[i, :] = rbf_func(x_new)
+            elif interpolation_method == 'spline':
+                # 默认 k=3 (三次)，如果点少于4个，降级为 k=1 (线性)
+                k_degree = 3 if len(x_known) > 3 else 1
+                spl_func = make_interp_spline(x_known, y_known, k=k_degree)
+                # BSpline 对象默认可调用进行外插
+                x_upsampled[i, :] = spl_func(x_new)
+            elif interpolation_method == 'akima':
+                akima_func = Akima1DInterpolator(x_known, y_known)
+                x_upsampled[i, :] = akima_func(x_new, extrapolate=True)
+        x = x_upsampled
+    return x
